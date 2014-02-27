@@ -1,0 +1,445 @@
+; LCD.s
+; Runs on LM3S1968
+; EE319K lab 6 device driver for the LCD
+; Valvano
+; March 2, 2013 (Spring 2013 version)
+;
+;  size is 1*16
+;  because we do not need to read busy, then we will tie R/W=ground
+;  10k potentiometer (not the slide pot for Lab 8)
+;      one end of pot is +5V, 
+;      center of pot to pin 3 of LCD,
+;      other end of pot is ground
+;  ground = pin 1    Vss
+;  power  = pin 2    Vdd   +5V (EE319K LCDs)
+;  pot    = pin 3    Vlc   connected to center of pot
+;  PF4    = pin 4    RS    (1 for data, 0 for control/status)
+;  ground = pin 5    R/W   (1 for read, 0 for write)
+;  PF5    = pin 6    E     (enable)
+;  PF0    = pin 11   DB4   (4-bit data)
+;  PF1    = pin 12   DB5
+;  PF2    = pin 13   DB6
+;  PF3    = pin 14   DB7
+;16 characters are configured as 2 rows of 8
+;addr  00 01 02 03 04 05 06 07 40 41 42 43 44 45 46 47
+
+
+        EXPORT   LCD_Open
+        EXPORT   LCD_Clear
+        EXPORT   LCD_OutChar
+        EXPORT   LCD_GoTo
+        EXPORT   LCD_OutString
+        EXPORT   LCD_OutChar
+        EXPORT   LCD_OutDec
+        EXPORT   LCD_OutFix
+SYSCTL_RCGC2_R          EQU 0x400FE108
+SYSCTL_RCGC2_GPIOF      EQU 0x00000020   ; port F Clock Gating Control
+GPIO_PORTF_DATA_R         EQU 0x400253FC    ; this is incorrect, is it x4002563F or something?
+GPIO_PORTF_DIR_R        EQU 0x40025400
+GPIO_PORTF_AFSEL_R      EQU 0x40025420
+GPIO_PORTF_DEN_R        EQU 0x4002551C
+
+PG7                EQU 0x40026200
+PG2                EQU 0x40026010
+GPIO_PORTG_DATA_R  EQU 0x400263FC
+GPIO_PORTG_DIR_R   EQU 0x40026400
+GPIO_PORTG_AFSEL_R EQU 0x40026420
+GPIO_PORTG_PUR_R   EQU 0x40026510
+GPIO_PORTG_DEN_R   EQU 0x4002651C
+SYSCTL_RCGC2_GPIOG EQU 0x00000040   ; port G Clock Gating Control
+
+LIMIT        EQU 10000
+BIGNUMBER    EQU 1000000000
+fpsix        EQU    140000
+twentytwo    EQU 5500000
+
+
+
+      AREA    |.text|, CODE, READONLY, ALIGN=2
+      THUMB
+      ALIGN       
+
+
+DELAY        ; R0 gets passed with the number of 40ns to delay + 1 (the number of clock cycles @ 50MHz) 
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		SUBS R0, R0, #1
+        BNE DELAY
+        BX LR
+
+;--------------- outCsrNibble ------------------
+; Sends 4 bits to the LCD control/status
+; Input: R0 is 4-bit command, in bit positions 3,2,1,0 of R0
+; Output: none
+; This is a private function
+; Invariables: This function must not permanently modify registers R4 to R11
+
+outCsrNibble                         
+      PUSH {R1,R2,R4,R14}        
+      MOV R1, R0        ; Create a copy of the input, since R0 has to be smashed immediately to pass stuff
+	  LDR R2, =GPIO_PORTF_DATA_R	; R2 is our address
+	  
+; before E, and Raising E  
+      MOV R0, #3
+      BL DELAY             ; Delay 60ns explicitly before raising E
+	  LDR R0, [R2]
+	  BIC R0, #0xEF			; Isolate RS
+	  ORR R0, R0, R1		; R0 gets the data plus the status of RS
+	  ORR R0, R0, #0x20		; And finally, set E high
+	;  BIC R0, #0x10			; Lower RS
+	  STR R0, [R2]			; Store the raised E
+     ; MOV R0, #20        ; 7 * 40ns  = 280ns to delay before introducing data
+     ; BL DELAY
+	  
+;  introducing data, and waiting to lower E   
+     ; LDR R0, [R2]        ;R2 has GPIO_PORTF_DATA_R address, so R0 has data
+      ;ORR R0, R0, R1    ; OR in the upper bits along with the appropriate RS and E value, because R1 has data copy
+	 ; BIC R0, #0x10		; Lower RS
+      ;STR R0, [R2]		; Store the data
+      MOV R0, #40
+      BL DELAY            ; explicitly wait 200ns before lowering E
+; lowering E, keeping data, then clearing and exiting     
+      LDR R0, [R2]			; get data
+	  BIC R0, #0x20			; lower E
+	  STR R0, [R2]			; store the data back, without E
+	  ;MOV R0, #5
+      ;BL DELAY            ; one cycle delay is sufficient for 10ns (Data Hold time)
+	 ; MOV R0, #0	
+	 ; STR R0, [R2]			; clear everything
+     MOV R0, #15        
+      BL DELAY            ; wait 600ns before repeating all for lower nibble
+      POP {R1, R2, R4 ,PC}
+
+
+
+;---------------------outCsr---------------------
+; Sends one command code to the LCD control/status
+; Input: R0 is 8-bit command to execute
+; Output: none
+;* Entry Mode Set 0,0,0,0,0,1,I/D,S
+;*     I/D=1 for increment cursor move direction
+;*        =0 for decrement cursor move direction
+;*     S  =1 for display shift
+;*        =0 for no display shift
+;*   Display On/Off Control 0,0,0,0,1,D,C,B
+;*     D  =1 for display on
+;*        =0 for display off
+;*     C  =1 for cursor on
+;*        =0 for cursor off
+;*     B  =1 for blink of cursor position character
+;*        =0 for no blink
+;*   Cursor/Display Shift  0,0,0,1,S/C,R/L,*,*
+;*     S/C=1 for display shift
+;*        =0 for cursor movement
+;*     R/L=1 for shift to left
+;*        =0 for shift to right
+;*   Function Set   0,0,1,DL,N,F,*,*
+;*     DL=1 for 8 bit
+;*       =0 for 4 bit
+;*     N =1 for 2 lines
+;*       =0 for 1 line
+;*     F =1 for 5 by 10 dots
+;*       =0 for 5 by 7 dots 
+; This is a private function
+; Invariables: This function must not permanently modify registers R4 to R11
+outCsr
+      PUSH {R0,R1,R2,R3,R4,LR}
+	  
+	 LDR R1, =GPIO_PORTF_DATA_R
+	 LDR R2, [R1]
+	 BIC R2, R2, #0x10	; To lower RS (command) for whole function
+	 STR R2, [R1]		; Storing this RS =0
+	 
+     MOV R1, R0			; R1 will be upper nibble
+	 MOV R2, R0			; R2 will be lower nibble
+	 BIC R1, #0x0F		; clear lower
+	 LSR R1, #4		; R1 now contains upper nibble shifted flush to the right
+	 MOV R0, R1			; to pass upper nibble (R1) in R0
+	 BL outCsrNibble
+	 
+	 BIC R2, #0xF0
+	 MOV R0, R2		
+	 BL outCsrNibble	; to pass lower nibble
+	 
+	MOV R0, #1000
+	BL DELAY
+	 
+	 
+      POP  {R0,R1,R2,R3,R4,PC}
+      BX LR
+
+;---------------------LCD_Open---------------------
+; initialize the LCD display, called once at beginning
+; Input: none
+; Output: none
+; This is a public function
+; Invariables: This function must not permanently modify registers R4 to R11
+LCD_Open 
+	PUSH {R0,R1,R2,LR}
+	LDR R0, =twentytwo                    ; 550 * 40us = 22ms
+    BL DELAY                        ; to delay 20ms or so
+
+	LDR R1, =SYSCTL_RCGC2_R     
+    LDR R0, [R1]
+    ORR R0, R0, #SYSCTL_RCGC2_GPIOF ; activate port F 
+    STR R0, [R1]                 
+    NOP
+    NOP                ; allow time to finish activating
+    STR R0, [R1] 
+    LDR R1, =GPIO_PORTF_DIR_R       
+    LDR R0, [R1]     
+    ORR R0, R0, #0xFF  ; PF7-0 output
+    STR R0, [R1]                    
+    LDR R1, =GPIO_PORTF_AFSEL_R    
+    LDR R0, [R1]                    
+    BIC R0, R0, #0xFF  ; no alt funct                              
+    STR R0, [R1]     
+    LDR R1, =GPIO_PORTF_DEN_R       
+    LDR R0, [R1]           
+    ORR R0, R0, #0xFF  ; enable PF7-0
+    STR R0, [R1]
+
+
+
+
+
+;**************************************************
+    
+    LDR R1, =GPIO_PORTF_DATA_R        ; R1 will contain the address of where we want to put stuff (PORTF data)
+    
+    MOV R0, #3
+    BL outCsrNibble                 ; putting %000000011 into PortF (so that only DB4 and 5 are 1s)
+	
+	BL outCsrNibble	; to pass lower nibble
+	 
+	MOV R0, #1000
+	BL DELAY
+      POP  {R0,R1,R2,R3,R4,PC}
+     
+    BX LR
+
+;---------------------LCD_Clear---------------------
+; clear the LCD display, send cursor to home
+; Input: none
+; Outputs: none
+; This is a public function
+; Invariables: This function must not permanently modify registers R4 to R11
+LCD_Clear
+        PUSH {R0,R3, LR}         
+        MOV R0, #0x01
+        BL outCsr      ;delay
+        MOV R3, #80
+loop_c1 SUB R3, R3, #1
+        CMP R3,#0
+        BNE loop_c1
+        MOV R0, #0x02
+        BL outCsr    ;delay
+        MOV R3, #80
+loop_c2 SUB R3, R3, #1
+        CMP R3,#0
+        BNE loop_c2
+        POP  {R0,R3, PC}
+
+
+;-----------------------LCD_GoTo-----------------------
+; Move cursor (set display address) 
+; Input: R0 is display address (DDaddr) is 0 to 7, or 0x40 to 0x47 
+; Output: none
+; errors: it will check for legal address
+;  0) save any registers that will be destroyed by pushing on the stack
+;  1) go to step 3 if DDaddr is 0x08 to 0x3F or 0x48 to 0xFFFFFFFF
+;  2) outCsr(DDaddr+0x80)     
+;  3) restore the registers by pulling off the stack
+; This is a public function
+; Invariables: This function must not permanently modify registers R4 to R11
+LCD_GoTo
+    PUSH {R0, R1,LR}   
+        MOV R1, R0    ;do the comparisons
+        CMP R1, #0x07
+        BPL out
+        CMP R1, #0x40
+        BMI done_g
+        CMP R1, #0x47
+        BPL out
+        B done_g     ;out
+out        ADD R0, R0, #0x80
+        BL outCsr
+done_g     ADD R0, R0, #0
+    POP  {R0, R1,PC}
+
+; ---------------------LCD_OutString-------------
+; Output character string to LCD display, terminated by a NULL(0)
+; Inputs:  R0 (call by reference) points to a string of ASCII characters 
+; Outputs: none
+; This is a public function
+; Invariables: This function must not permanently modify registers R4 to R11
+LCD_OutString
+    PUSH {R0, R1,R4,LR}   
+        MOV R1, R0
+loop_s     LDRB R0, [R1]
+        CMP R0, #0
+        BEQ term
+        BL LCD_OutChar
+        ADD R1, R1, #1    
+        B loop_s
+ 
+ 
+term    
+        POP {R0, R1,R4,PC}
+
+
+
+;-----------------------LCD_OutDec-----------------------
+; Output a 32-bit number in unsigned decimal format
+; Input: R0 (call by value) 32-bit unsigned number 
+; Output: none
+; This is a public function
+; Invariables: This function must not permanently modify registers R4 to R11
+LCD_OutDec
+    PUSH {R0,R1, R2, R3, R4, R7,LR}
+         MOV R1, R0			; R1 has copy of the decimal to output
+		 MOV R4, #10		; R4 will have a constant 10
+         LDR R3, =BIGNUMBER	; R3 10e9 (one billion) will serve as a divisor
+		 MOV R7, #0
+loop     UDIV R0, R1, R3
+		 CMP R7, #1			; check our flag
+		 BEQ zerocase
+		 ADDS R0, R0, #0	; to set condition code
+		 BEQ no
+zerocase ADD R0, R0, #0x30	; Shift the current digit to ASCII land
+         BL LCD_OutChar
+		 MOV R7, #1			; put our flag up if something has been printed
+		 SUB R0, R0, #0x30	; Inverse ASCII transform
+no       MUL R2, R0, R3		; R0 contains the digit for the iterations place value, and so R2 has that without resolution
+         SUB R1, R1, R2		; R1 contains the value with the previous iteration chopped off
+         UDIV R3, R3, R4	; Reducing your "big number" by a power of 10
+		 
+         CMP R3, #1			; this bloc allows for a plain 0 to be printed, when it wouldn't otherwise
+		 BNE continue		; if we are on the last digit
+		 CMP R1, #0			; if it is a zero
+		 BEQ zerocase		; print it.
+		 MOV R0, R1
+		 ADD R0, R0, #0x30
+		 BL LCD_OutChar
+		 B done
+		 
+continue CMP R3, #0 
+		 BEQ done
+         B loop
+done     ADD R0, R0, #0
+
+
+    POP  {R0,R1, R2, R3, R4,R7,PC}
+
+
+; -----------------------LCD _OutFix----------------------
+; Output characters to LCD display in fixed-point format
+; unsigned decimal, resolution 0.001, range 0.000 to 9.999 
+; Inputs:  R0 is an unsigned 16-bit number
+; Outputs: none
+; E.g., R0=0,    then output "0.000 " 
+;       R0=3,    then output "0.003 " 
+;       R0=89,   then output "0.089 " 
+;       R0=123,  then output "0.123 " 
+;       R0=9999, then output "9.999 " 
+;       R0>9999, then output "*.*** "
+; This is a public function
+; Invariables: This function must not permanently modify registers R4 to R11
+LCD_OutFix
+	PUSH {R0, R1, R2, R3, R4, LR}
+        LDR R1, =LIMIT
+        CMP R0, R1
+        BMI normal
+		B special	;print "*.***"  
+    ;R0, contains orignal number
+normal  MOV R1, R0    ; copy the orignal number into R1
+        MOV R3, #1000
+        UDIV R0, R0, R3    ;R0 = R0/R3, get the first number
+        ADD R0, R0, #0x30    ;get the ascii value
+        BL LCD_OutChar
+        MOV R3, R0    ;store whats left in R0, with the ASCII shift
+ 
+        MOV R0, #0x2E
+        BL LCD_OutChar    ;print the decimal point
+        MOV R0, R3		; R0 gets the remainer from previous div, in ASCII land
+        MOV R3, #1000	
+        SUB R0, R0, #0x30	; R0 gets shifted back from ascii
+        MUL R0, R0, R3		; R0 gets the original thing back, but loses the resolution already printed?
+        SUB R1, R1, R0    ;left with three digits
+ 
+        MOV R0, R1    ; copy the number into R0
+        MOV R3, #100
+        UDIV R0, R0, R3    ;R0 = R0/R3, get the first number
+        ADD R0, R0, #0x30    ;get the ascii value
+        BL LCD_OutChar
+        ;MOV R3, R0    ;store whats left in R0
+ 
+        SUB R0, R0, #0x30
+        MUL R0, R0, R3
+        SUB R1, R1, R0    ;left with two digits
+ 
+        MOV R0, R1    ; copy the number into R0
+        MOV R3, #10
+        UDIV R0, R0, R3    ;R0 = R0/R3, get the first number
+        ADD R0, R0, #0x30    ;get the ascii value
+        BL LCD_OutChar
+        ;MOV R3, R0    ;store whats left in R0
+ 
+        SUB R0, R0, #0x30
+        MUL R0, R0, R3
+        SUB R1, R1, R0    ;left with one
+ 
+        MOV R0, R1
+		ADD R0, R0, #0x30
+        BL LCD_OutChar
+        B done_f
+ 
+special
+        MOV R0, #0x2A
+        BL LCD_OutChar        
+        MOV R0, #0x2E
+        BL LCD_OutChar
+        MOV R0, #0x2A
+        BL LCD_OutChar
+        BL LCD_OutChar
+        BL LCD_OutChar
+ 
+done_f  ADD R0, R0, #0     
+         POP {R0,R1, R2, R3, R4,PC}
+
+   
+
+    ALIGN                           ; make sure the end of this section is aligned
+    END                             ; end of file
+
+    
