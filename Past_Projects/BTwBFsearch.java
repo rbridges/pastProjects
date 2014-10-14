@@ -6,7 +6,7 @@ import java.util.*;
 
 /**
  * Class for a binary tree that stores type E objects.
- * @author Koffman and Wolfgang
+ * Author of the basics of the data structure:  Koffman and Wolfgang
  **/
 public class BinaryTree<E> implements Serializable {
 
